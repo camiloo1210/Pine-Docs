@@ -1,5 +1,5 @@
 // =====================================================================
-// PINE — AI II, Deliverable 1 (12 October 2026)
+// PINE — AI II, Deliverable 2: Methods and preliminary results
 // Estilo IEEE conference (mismo look & feel que SNNTraffic).
 // Edita SOLO los datos de autores en el bloque "AUTORES" más abajo.
 // =====================================================================
@@ -137,15 +137,14 @@
 ]
 
 // ------------------------------ ABSTRACT -----------------------------
-// Bloque a una columna con márgenes interiores (como el SNNTraffic)
 #block(width: 100%, inset: (x: 0.28in), above: 0pt, below: 0.9em)[
   #set text(size: 9pt, weight: "bold")
   #set par(first-line-indent: 0pt, leading: 0.5em, spacing: 0.5em)
   #text(style: "italic" )[Abstract]\
 
-  Personal finance applications increasingly use artificial intelligence to process receipts automatically. However, cloud-based solutions may expose sensitive financial information, while traditional offline optical character recognition (OCR) systems often struggle to identify the meaning of extracted text. This paper presents a research proposal based on PINE, an open-source personal finance application designed to work offline and protect user privacy. Its current system uses YOLOv8n to detect receipts, OpenCV to correct image perspective, and PaddleOCR to recognize text. The proposed improvement is to integrate a Transformer model, such as LayoutLMv3, to identify important information, including the merchant, date, total amount, and taxes. The YOLOv8n model was trained using 5,086 receipt images and 500 negative samples. Training stopped automatically at epoch 116, with its best reported validation Mean Average Precision (mAP\@50) of 0.995 at epoch 91, measured using a 50% intersection-over-union threshold. Although these results show strong receipt detection performance on the validation dataset, they do not guarantee accurate extraction of financial information. Therefore, this study proposes comparing the current system with the Transformer-based approach, evaluating extraction accuracy, processing time, and resource consumption. The goal is to determine whether Transformers can improve receipt information extraction while maintaining privacy and efficient offline operation.
+  Cloud receipt scanners expose sensitive financial data, while classical offline OCR pipelines read text but do not know which token is the merchant, the date, the total or the tax. This report describes the implemented methods and the first measured results of PINE, an open-source, offline personal finance application (.NET, Avalonia; Windows and Android). The pipeline detects the receipt with YOLOv8n, rectifies it, reads it with PP-OCRv5 executed through ONNX Runtime, and extracts four fields with a deterministic heuristic baseline, a fine-tuned LayoutLMv3 token classifier (INT8, 128 MB), and a hybrid that overlays the model on the heuristics. On a frozen test split of 164 receipts (CORD and SROIE) and the same PaddleOCR output for every system, the Macro-F1 over the four fields is 0.702 for the heuristic baseline, 0.894 for LayoutLMv3 alone and 0.904 for the hybrid; the Deliverable 1 baseline scored 0.389 before a number-format defect was corrected. The model stage costs a median of 254 ms and a P95 of 855 ms per document on a Ryzen 7 5700G CPU, and the whole scan runs in about 8.9 s on a 4 GB Android tablet. We also report negative results (binarization hurts OCR, width-batched recognition is slower on CPU), the limits of the evidence (164 documents, South-East-Asian receipts, no Spanish ground truth) and an adjusted five-week plan.
 
-  #text(style: "italic")[Index Terms]—document understanding, YOLOv8, OCR, LayoutLMv3, key information extraction, offline AI, privacy.
+  #text(style: "italic")[Index Terms]—document understanding, YOLOv8, PP-OCRv5, LayoutLMv3, key information extraction, ONNX, offline AI, privacy.
 ]
 \
 
@@ -153,105 +152,245 @@
 #show: columns.with(2, gutter: 0.25in)
 
 = Introduction
-Personal finance management frequently requires users to transcribe merchant names, dates, amounts, and taxes from photographed receipts. Such images vary in illumination, perspective, background clutter, and document layout. Although OCR converts pixels to text, recovering a financially meaningful record also requires determining _which_ recognized token represents each field. A privacy-oriented application faces the additional constraint that sensitive receipts must not leave the user's device.
+Personal finance applications ask users to transcribe merchants, dates, amounts and taxes from photographed receipts. OCR turns pixels into text, but a financial record also requires deciding _which_ recognized token plays which role, and a privacy-oriented application must do so without sending the image to a server. PINE is an open-source, offline-first finance manager built with .NET and Avalonia UI; this report documents the receipt-understanding stack that was implemented during the first half of the project and the first measurements obtained with it.
 
-PINE is an open-source, offline-first desktop personal finance manager built with .NET and Avalonia UI. Its local document pipeline detects the receipt, corrects its perspective, and applies OCR. Its proposed research extension focuses on improving semantic extraction rather than replacing the entire finance application. The central research question is: _Can a layout-aware Transformer improve receipt field extraction over a heuristic OCR baseline without violating offline operation or imposing impractical local inference costs?_
+*Feedback from Deliverable 1.* The proposal left three items open: it contained no measured field-level result, its baseline had not been reproduced, and its dataset was not audited. This version addresses them: the 5,086-image detector corpus is unchanged, but the field-extraction study now uses an audited, frozen split of 3,391 labelled receipts (@tab-data), the baseline is reproduced from a script (Section III-E), and every number below is either re-measured for this report or explicitly attributed to its source. Two statements of the proposal also changed. First, PaddleOCR was replaced at run time by the same PP-OCRv5 weights exported to ONNX, so that one engine runs on Windows and on Android. Second, the measurements show that a large part of the baseline's weakness was a locale defect in decimal parsing, which is why it is reported before and after the fix.
 
-The working hypothesis is that multimodal text-and-layout features will increase field-level F1 compared with heuristic parsing, while model quantization or a lightweight fallback may be necessary to satisfy device constraints. The intended contributions are (i) a reproducible comparison of receipt-understanding approaches in a privacy-preserving desktop setting, (ii) an evaluation of the accuracy–latency–memory trade-off, and (iii) a documented integration strategy. No improvement from the proposed Transformer is claimed at this proposal stage.
-
-The remainder of this document is organized as follows. Section II reviews related work on document understanding and receipt parsing. Section III describes the existing system, the proposed comparison, and the evaluation protocol. Section IV presents a ten-week work plan. Section V discusses risks and alternative strategies. Finally, Section VI states the research-integrity position and the expected outcome.
+The research question is unchanged: _can a layout-aware Transformer improve field extraction over a heuristic OCR baseline without violating offline operation or imposing impractical on-device cost?_ The contributions of this report are (i) a reproducible implementation and protocol (Sections II–III), (ii) a first three-way comparison with latency and memory (Section IV), and (iii) a list of failures, limits and corrections with an adjusted plan (Sections V–VI).
 
 = Related Work
-Document understanding has progressed from isolated text recognition toward joint modeling of visual and spatial information. LayoutLM incorporates textual and two-dimensional layout features for document analysis [1], while LayoutLMv3 jointly learns text, image, and alignment representations and reports results on receipt-understanding tasks [2]. These approaches motivate the proposed layout-aware extraction stage, but their reported benchmark outcomes cannot be transferred directly to PINE's dataset or hardware.
+LayoutLM and LayoutLMv3 jointly model text, 2-D position and image patches for document understanding [1], [2]; Donut removes the OCR stage [3]; TrOCR replaces the recognizer by a Transformer [4]; PP-OCR is a practical lightweight OCR system [5]; CORD is a receipt corpus for post-OCR parsing [6]; YOLOv8 is the detection and segmentation software used for localisation [7]. SROIE (ICDAR 2019) and WildReceipt supply Malaysian and mostly Western receipts with merchant, date and total [8], [9]. We reuse these components; the contribution is their end-to-end evaluation inside a no-network application, not a new architecture.
 
-Donut presents an OCR-free document-understanding Transformer [3], offering an alternative to pipelines that propagate OCR errors into downstream extraction. TrOCR instead targets text recognition through pre-trained Transformer components [4]; therefore, it is a candidate OCR replacement, not a directly equivalent key-information extraction (KIE) baseline. PP-OCR studies a practical lightweight OCR system [5], supporting the rationale for efficient recognition pipelines. CORD provides a consolidated receipt dataset for post-OCR parsing research [6], illustrating the importance of annotated fields and consistent evaluation protocols. YOLOv8 is documented as detection and segmentation software rather than as a peer-reviewed YOLOv8 research paper [7].
+= Methods
+== Data and Environment
+@tab-data lists the labelled corpus. Labels are stored as word-level BIO tags plus a document-level ground-truth value per field. No public set annotates all four fields on every document: CORD gives TOTAL and TAX, SROIE gives MERCHANT, DATE and TOTAL, WildReceipt gives all four. Unannotated fields are therefore masked during training and excluded (not counted as zero) when scoring, per document. The audit script found no image-hash group that crosses a split (27 duplicate groups, 0 leaking) and 204 word boxes outside the image, which were kept and clipped.
 
-Unlike work evaluated primarily on standalone document benchmarks, the proposed study will assess _end-to-end_ field extraction, local execution cost, and a no-network operational constraint within PINE. The comparison is therefore about system-level suitability, not an unsupported claim of novel Transformer architecture.
+#figure(
+  table(
+    columns: (auto, auto, auto, auto, auto),
+    align: (left, right, right, right, right),
+    [Source], [Docs], [With MERCH.], [With TOTAL], [With TAX],
+    [CORD (Indonesia)], [1,000], [0], [972], [444],
+    [SROIE (Malaysia)], [652], [652], [651], [0],
+    [WildReceipt], [1,739], [1,308], [1,540], [1,171],
+    [*Total*], [*3,391*], [*1,960*], [*3,163*], [*1,615*],
+  ),
+  caption: [Labelled corpus used for field extraction],
+  kind: table,
+) <tab-data>
 
+The model is trained on 2,461 documents (CORD and SROIE train plus WildReceipt train minus a hash-grouped 10 % carve-out), validated on 294, and evaluated on two held-out sets: the *main test* of 164 documents (CORD 101, SROIE 63), which is the set used for every end-to-end comparison below, and the official WildReceipt test (472) used only for the model's generalisation check. The splits are frozen in `splits.json` and `splits_colab.json` (seeds 20260101 and 42). The detector (YOLOv8n-seg) is trained on 5,086 receipt images plus 500 negatives, as in Deliverable 1; a further 12,004 Roboflow images (7,207 groups after perceptual-hash de-duplication, 150 sampled for a frozen test) are being hand-verified and are not yet used for any score.
 
-= Proposed Methodology
-== Existing System and Preliminary Evidence
-The current image-processing path is summarized in @fig-pipeline. A receipt image is segmented by YOLOv8n, rectified through OpenCV contour approximation and perspective warping, read by PaddleOCR, parsed by deterministic heuristics, and finally confirmed by the user.
+*Environment.* Training: Google Colab, T4 GPU, fp16. Inference and every latency figure: Windows 11, AMD Ryzen 7 5700G (16 threads), ONNX Runtime 1.29 CPU provider, no GPU. Mobile checks: an Android 14 tablet (SM-P613 class, 4 GB RAM). The application declares no network permission on Android and reads no URL at run time. Code, scripts and instructions are in the project repository (`research/README.md`; Python 3.12, .NET).
+
+== Pre-processing and Pipeline
+@fig-pipeline shows the implemented path. (1) A YOLOv8n-seg model (13 MB, ONNX) segments the receipt; its mask becomes a maximum-area inscribed quadrilateral. Windows uses OpenCV for the mask and warp; Android uses an equivalent managed Skia implementation, then a classical quad finder as fallback. The corners are shown to the user as an editable outline (Android). (2) The perspective warp produces the cropped colour image. (3) A screen-photo detector (spectral peak in the 2–6 px band, threshold 1,500) switches to a 0.6× down-scale plus background flattening; otherwise the colour crop is used unmodified (Section IV-C explains why binarization was dropped). (4) A dominant-line-angle estimate rotates tilted receipts back (|angle| > 3°) before reading. (5) PP-OCRv5 mobile detection and the Latin recognizer read the text; (6) extraction runs on word boxes.
 
 #figure(
   {
-    set text(size: 7pt)
+    set text(size: 6.6pt)
     set par(first-line-indent: 0pt, justify: false, leading: 0.4em)
     let node(body, fill: luma(240)) = box(
-      width: 100%, inset: (x: 3pt, y: 4pt), radius: 1.5pt,
+      width: 100%, inset: (x: 2pt, y: 3.5pt), radius: 1.5pt,
       stroke: 0.5pt + luma(60), fill: fill, align(center + horizon, body),
     )
-    let arrow = align(center + horizon, text(size: 9pt)[→])
+    let hl = luma(205)
+    let arrow = align(center + horizon, text(size: 8pt)[→])
     grid(
-      columns: (1fr, 8pt, 1fr, 8pt, 1fr),
+      columns: (1fr, 7pt, 1fr, 7pt, 1fr, 7pt, 1fr),
       row-gutter: 5pt,
       align: horizon,
-      node[Receipt image], arrow, node[YOLOv8n segmentation], arrow, node[OpenCV contour + perspective warp],
-      grid.cell(colspan: 5, align(center, text(size: 9pt)[↓])),
-      node[User review], arrow, node[Heuristic field parsing], arrow, node[PaddleOCR],
+      node[Photo / camera], arrow, node[YOLOv8n-seg + quad], arrow, node[Warp, enhance, deskew], arrow, node[PP-OCRv5 (ONNX)],
+      grid.cell(colspan: 7, align(right, text(size: 8pt)[↓ #h(10pt)])),
+      node(fill: hl)[User review + tax field], arrow, node(fill: hl)[Merger: model overlays heuristics], arrow, node(fill: hl)[LayoutLMv3 INT8 (token classes)], arrow, node[Heuristic parser],
     )
   },
-  caption: [Existing offline receipt-processing pipeline in PINE.],
+  caption: [Implemented pipeline. Shaded blocks are the new contribution.],
   kind: image,
   supplement: [Fig.],
 ) <fig-pipeline>
 
-The segmentation checkpoint was trained using 5,086 receipt images supplemented by 500 negative images from a negative-samples computer-vision dataset. Training was configured for 150 epochs, with early stopping after 25 epochs without improvement; the run stopped at epoch 116. The best reported validation mAP\@50 was 0.995 at epoch 91. The exported deployment artifact is an approximately 13 MB ONNX model derived from `best.pt`.
+== Algorithms and Hyperparameters
+*Heuristic baseline.* A deterministic parser groups OCR boxes into rows (deskewed), searches Spanish and English keywords (TOTAL, SUBTOTAL, IVA, GST, tip, discount, delivery), and reads amounts with a per-receipt separator inference: the decimal mark is decided once from all numbers on the receipt, so `1,591,600` is a thousands group and `2,08` a decimal. Percentages and five-digit identifiers are never amounts; tax rows are never products; items are cross-checked against the printed subtotal.
 
-These figures describe the supplied training record, not an independently reproduced test. The precise negative-sample annotation policy, split composition, and field-extraction performance will be audited before comparison. High receipt-detection mAP does not imply high merchant/date/total/tax extraction accuracy.
-== Proposed Comparison and Data Protocol
-The principal baseline will be the existing YOLOv8n + OpenCV + PaddleOCR + deterministic parsing pipeline. The proposed treatment will retain receipt detection and OCR, then use LayoutLMv3 with OCR tokens and normalized 2D word coordinates for KIE. Donut may be examined as an OCR-free alternative if compute and annotation resources permit; TrOCR will be considered only as an OCR-stage alternative. Each approach must use the same held-out receipt images and target-field definitions.
-
-The team will audit the 5,086-image corpus, separate the 500 negative samples, check duplicates and near-duplicates, and create document-level train/validation/test partitions without leakage. A labeled subset must include ground-truth merchant, date, total, and tax fields; missing taxes will be explicitly represented rather than guessed. Public receipt data such as CORD [6] may support external testing subject to license and label compatibility. Training and experimentation may use Google Colab, but the final PINE inference pathway must remain local and network-independent.
-
-== Evaluation and Reproducibility
-We evaluate performance using the following metrics:
-- Per-field precision, recall, and F1 (exact match after documented normalization), as primary measures
-- Macro-F1 across the four fields and complete-record accuracy
-- Detection reported separately: bounding-box and mask mAP\@50 and mAP\@50–95
-- Median and 95th-percentile CPU latency per document, peak RAM, model size, and offline execution success
-
-Experiments will log model versions, splits, random seeds, inference hardware, and preprocessing settings. Error analysis will stratify by perspective, blur, lighting, and document layout. The study will also test whether the 500 negative images reduce false detections on non-receipt inputs.
-
-= Ten-Week Work Plan
-The remaining ten weeks are organized as described in @tab-plan.
+*LayoutLMv3 token classifier.* `microsoft/layoutlmv3-base` (about 125 M parameters) fine-tuned for 9 BIO labels over the four fields. Inputs are OCR word boxes normalised to 0–1000, the token ids, and a 224×224 page image; long documents use 512-token windows with stride 128. The hyperparameters in @tab-hyper were fixed before the run and not tuned. The model was exported to ONNX (opset 17) and dynamically quantized to INT8, including the embedding table, and runs inside the .NET application through ONNX Runtime. Spans are decoded to a value with the same number parser as the heuristics.
 
 #figure(
   table(
-    columns: (0.17fr, 0.55fr, 0.28fr),
+    columns: (0.5fr, 0.5fr),
     align: left,
-    [Weeks], [Milestone / Evidence], [Lead],
-    [6–7], [Audit datasets, annotations, splits; reproduce YOLO checkpoint and heuristic baseline.], [All authors],
-    [8–9], [Implement LayoutLMv3 KIE and field normalization; prepare reproducible runs.], [All authors],
-    [10], [Compare preliminary field metrics; submit Methods and initial Results.], [All authors],
-    [11–12], [Run controlled experiments and latency/memory benchmarks; analyze errors.], [All authors],
-    [13–14], [Validate robustness and ablations; integrate the chosen local inference path.], [All authors],
-    [15], [Finalize IMRaD paper, references, repository and presentation.], [All authors],
+    [Parameter], [Value],
+    [Optimizer / LR], [AdamW (HF Trainer), 5·10#super[−5]],
+    [Weight decay / warm-up], [0.01 / 10 % of steps],
+    [Batch], [4 × 4 accumulation = 16],
+    [Epochs / patience], [15 max / 4 (val F1)],
+    [Epoch reported], [11; 3,541 s total],
+    [Window / stride], [512 / 128 tokens],
+    [Labels], [first sub-token; partial masking],
+    [Precision / seed], [fp16 / 42],
   ),
-  caption: [Work plan for the remaining 10 weeks],
+  caption: [LayoutLMv3 fine-tuning configuration],
   kind: table,
-) <tab-plan>
+) <tab-hyper>
 
-Responsibilities are shared: Author 1 owns dataset integrity and detector reproduction; Author 2 owns Transformer modeling and the Typst manuscript; Author 3 owns benchmarks, integration validation, and figures. All three review experiments, writing, and oral defense.
-\
-\
-\
-= Risks and Alternatives
+*Hybrid.* `LayoutLmResultMerger.Overlay` lets the model override a field whenever it finds one, keeps the heuristics' items, and reconciles the two tax readings by checking which one agrees with the other lines and the printed total.
 
-== Insufficient KIE Labels
-Annotate a smaller representative subset with double review; use a licensed public receipt dataset for supplementary evaluation.
+== Protocol and Metrics
+All three systems consume the *same* PaddleOCR 3.7 output of the same 164 test documents, so differences come from the extraction stage only. A field is correct if its normalised value matches the ground truth (merchant: case, punctuation and spacing folded; amounts: decimal, tolerance 0.01; date: ISO). Per field we report precision, recall and F1, with documents lacking ground truth for that field excluded. The Macro-F1 averages MERCHANT, DATE, TOTAL and TAX. This value-level, OCR-in-the-loop score is stricter than the token-span F1 of the training notebook and the two must not be compared. Latency is the median and P95 of the model stage (image decode, tokenisation, inference, decoding; OCR excluded) per document, plus peak RSS from a padded 512-token benchmark. Because 164 documents is small, differences below about two F1 points are treated as noise.
 
-== Transformer Resource Demands
-Test ONNX quantization and CPU inference; retain the deterministic baseline if limits are exceeded.
+== Reproducing the Baseline
+From `research/`: `ocr_dump.py` writes the OCR JSON; `dotnet run --project baseline_dotnet -- data/ocr_paddle data/pred` runs the heuristics, and with `--layoutlm model.onnx tokenizer.json` also the model and hybrid; `eval_fields.py --pred data/pred --split test` scores. All results in Section IV were regenerated with these commands on the current code. The code base is covered by 2,575 passing automated tests, including parity tests that check the Windows and Android heads wire the same pipeline stages; 13 tests fail on the current branch (9 build-hygiene checks caused by a disabled CI workflow, 4 timing-sensitive UI tests that pass in isolation).
 
-== Domain Shift and False Positives
-Evaluate receipts, invoices, and non-document negatives separately; document generalization failures rather than inferring robustness from validation mAP.
+= Preliminary Results
+== Field Extraction
+@tab-fields and @fig-f1 compare the baseline and the proposed approach on the 164-document test set. The Deliverable 1 baseline is shown as a reference row: its TOTAL F1 of 0.191 was dominated by CORD (0.04), where thousands-separated amounts such as `1,591,600` were read as decimals. Correcting the number reader (not the OCR, not the model) raised the heuristic TOTAL to 0.486 and added a tax reader (F1 0 → 0.776), so part of the model's gain over the original baseline is the baseline's locale, not the Transformer.
 
-== Schedule or Reproducibility Gaps
-Freeze data splits, record environment versions, and prioritize a completed baseline comparison before optional architectures.
+#figure(
+  table(
+    columns: (1.1fr, 0.7fr, 0.6fr, 0.7fr, 0.6fr, 0.7fr),
+    align: (left, right, right, right, right, right),
+    [System], [MERCH.], [DATE], [TOTAL], [TAX], [Macro],
+    [Heuristics (D1)], [.444], [.918], [.191], [0], [.389],
+    [Heuristics (now)], [.571], [.976], [.486], [.776], [.702],
+    [LayoutLMv3 only], [.778], [.959], [.931], [.909], [.894],
+    [*Hybrid (shipped)*], [*.778*], [*.992*], [*.923*], [*.923*], [*.904*],
+  ),
+  caption: [Field F1 on the main test set (164 docs; 63 for MERCHANT and DATE, 163 for TOTAL, 41 for TAX)],
+  kind: table,
+) <tab-fields>
 
-= Research Integrity and Expected Outcome
-This first deliverable is a research proposal with historical detector-training evidence, not a completed comparative experiment. Subsequent reports will distinguish measured results from targets and document limitations, bias, and threats to validity. Generative AI assistants were used to support drafting, organization, and technical exploration; the authors remain responsible for checking sources, claims, code, and results. The intended outcome is an evidence-based decision on whether layout-aware KIE is sufficiently accurate and efficient for privacy-preserving local receipt processing.
+#figure(
+  {
+    set text(size: 6.5pt)
+    set par(first-line-indent: 0pt, justify: false)
+    let cats = ([MERCHANT], [DATE], [TOTAL], [TAX])
+    let series = (
+      (name: "Heuristics", vals: (0.571, 0.976, 0.486, 0.776), fill: luma(190)),
+      (name: "LayoutLMv3", vals: (0.778, 0.959, 0.931, 0.909), fill: rgb("#6f8fc9")),
+      (name: "Hybrid", vals: (0.778, 0.992, 0.923, 0.923), fill: rgb("#1a3d7c")),
+    )
+    let ch = 62pt
+    let col(i) = grid(
+      columns: (1fr,) * 3, column-gutter: 1.5pt,
+      ..series.map(s => {
+        let v = s.vals.at(i)
+        align(bottom, stack(dir: ttb, spacing: 1pt,
+          align(center, text(size: 5pt)[#str(calc.round(v, digits: 2)).trim("0", at: start)]),
+          rect(width: 100%, height: v * ch, fill: s.fill, stroke: none)))
+      })
+    )
+    box(width: 100%, inset: (x: 4pt))[
+      #grid(columns: (1fr,) * 4, column-gutter: 7pt, ..range(4).map(i => box(height: ch + 9pt, col(i))))
+      #line(length: 100%, stroke: 0.5pt)
+      #grid(columns: (1fr,) * 4, column-gutter: 7pt, ..cats.map(c => align(center, c)))
+      #v(2pt)
+      #align(center)[
+        #for s in series [#box(width: 6pt, height: 6pt, fill: s.fill) #s.name #h(8pt)]
+      ]
+    ]
+  },
+  caption: [Field-level F1 of the three systems on the main test set.],
+  kind: image,
+  supplement: [Fig.],
+) <fig-f1>
+
+The model's largest gains are on TOTAL (0.486 → 0.931) and MERCHANT (0.571 → 0.778); the heuristics already read dates well (0.976). Overlaying the model on the heuristics gives the best Macro-F1 (0.904 vs 0.894) and the best DATE and TAX, but it lowers TOTAL by 0.8 points (0.931 → 0.923); with 164 documents these differences are about one to three documents and are within noise. Error counts for the hybrid are MERCHANT 14 wrong, TOTAL 13 wrong, DATE 4 missing, TAX 1 wrong and 5 missing (earlier run). Most merchant errors are boundary or single-character OCR errors (`HOME MASTER HARDWARE &` against `... & ELECTRICAL`), which exact-match scoring counts as wrong.
+
+*Generalisation.* On the official WildReceipt test (472 documents, mostly Western retail, the closest set to PINE's users) the PyTorch model scores token-span F1 of 0.825 (DATE 0.978, TAX 0.854, MERCHANT 0.765, TOTAL 0.727), against 0.959 on the main test. The 13-point gap shows that the main-test figure should not be projected onto real users.
+
+== Model Cost and Quantization
+@tab-quant shows why the INT8 model with quantized embeddings was selected: it loses 0.2–0.5 F1 points against FP32 and is four times smaller. In the end-to-end C\# run the model stage took a median of 254 ms and a P95 of 855 ms per document (164 documents, 0 failures). A first-use cost of about 1.4 s (loading) is hidden on Android by warming the model at start-up.
+
+#figure(
+  table(
+    columns: (auto, auto, auto, auto, auto, auto),
+    align: (left, right, right, right, right, right),
+    [Model], [MB], [F1 test], [F1 WildR.], [Med. ms], [RSS MB],
+    [FP32], [501.6], [.965], [.831], [651], [806],
+    [INT8], [247.0], [.960], [.823], [513], [619],
+    [INT8 + emb.], [128.4], [.962], [.828], [526], [511],
+  ),
+  caption: [Quantization (token-span F1 on dataset OCR; latency on padded 512 tokens, 16 threads)],
+  kind: table,
+) <tab-quant>
+
+== Image Enhancement and OCR
+The Windows pipeline originally binarized the crop (grey, Gaussian 5×5, adaptive threshold). Measured on 20 test images with the ONNX engine, ground-truth word recall was 92.2 % for the colour image and 78.1 % binarized (@tab-enh), so the colour crop is now used. For synthetic photos of a screen, a 0.6× down-scale plus background flattening recovers 73.4 % against 61.8 % unprocessed. The synthetic screens are a stand-in: no real screen photograph has been measured. The ONNX OCR engine matches PaddlePaddle's own inference on 99.3 % of lines (CER 0.89 %), and reproduces a Python reference exactly (565 of 565 lines).
+
+#figure(
+  table(
+    columns: (0.62fr, 0.19fr, 0.19fr),
+    align: (left, right, right),
+    [OCR input], [Clean], [Screen],
+    [Colour as is], [92.2], [61.8],
+    [Binarize (previous)], [78.1], [51.2],
+    [Flatten], [89.8], [66.1],
+    [Down-scale 0.6 + flatten], [88.5], [73.4],
+  ),
+  caption: [Word recall (%) by OCR input, 20 images],
+  kind: table,
+) <tab-enh>
+
+== Receipt Detection and Taxes
+The detector's validation mAP\@50 of 0.995 (Deliverable 1) is a training-record figure, not a field result. On 80 real photographs the OpenCV and the portable Skia detectors each accepted 10 and agreed on the crop size within 8 % for 9 of them. After the relaxed acceptance rules for still photographs (mask 2–100 % of the frame), the portable detector produced a quadrilateral for 148 of 150 labelled photos; this measures that a crop is produced, not that it is correct, and a hand-verified score is pending.
+
+Tax handling was audited separately. Before the correction, rows such as cash, change, subtotal, GST, rounding and service were read as products in 54 of 164 documents (78 of 337 items); afterwards in 1 of 164. Tilted photographs broke row grouping: on one invoice, 8° and 12° gave one item and a wrong total, and 20° gave none; after levelling, 0°, 5°, 8°, 12°, 20° and −12° all read three items, tax 9.06 and total 154.06.
+
+== On-device Timing
+A single scan on the Android tablet took about 8.9 s in total (down from 15.7 s): preparation 0.94 s, OCR 5.25 s (detection 0.79 s, recognition 4.11 s for 44 text lines) and LayoutLM 2.45 s (loading 1.43 s, inference 0.76 s). This is one run on one device and carries no confidence interval. The preview frame rate was not measured.
+
+#figure(
+  table(
+    columns: (0.5fr, 0.25fr, 0.25fr),
+    align: (left, right, right),
+    [Stage (Android tablet)], [ms], [Share],
+    [Preparation (decode, YOLO crop, enhance)], [938], [11 %],
+    [OCR: detection], [793], [9 %],
+    [OCR: crops + recognition (44 lines)], [4,323], [49 %],
+    [LayoutLMv3 (load 1,432 + run 764)], [2,446], [27 %],
+    [Other / heuristics], [≈ 400], [4 %],
+    [*Total*], [*≈ 8,900*], [*100 %*],
+  ),
+  caption: [Latency breakdown of one scan on a 4 GB tablet],
+  kind: table,
+) <tab-device>
+
+The text-recognition stage dominates; the model's load time is the second target and is now paid at start-up.
+
+= Preliminary Discussion
+*What the data support.* Within this test set, a layout-aware model clearly improves TOTAL and MERCHANT over the heuristic parser, the hybrid is marginally better than either, and the cost is bounded (about 0.25 s median per document on desktop CPU, a 128 MB file, about 0.5 GB of RAM). That supports the hypothesis for the studied data; it does not show the same for Spanish or Western retail receipts.
+
+*Problems found and how they are handled.*
+- *Locale defects masquerade as model gains.* Decimal-versus-thousands errors alone cost about 0.3 TOTAL F1. Handled with a single per-receipt number reader and regression tests; the baseline is now reported in both states.
+- *Missing and partial labels.* No document set has all four fields, and TAX covers 48 % of documents. Handled with per-source masking and field-wise scoring. A side effect is that an "O" word of an unannotated field is learned as background.
+- *Domain shift.* A 13-point drop on WildReceipt and an unmeasured Spanish performance. Planned: label a few hundred Spanish and Latin American receipts and evaluate (and, if needed, fine-tune) before trusting the overlay.
+- *Overfitting and variance.* Validation (0.892) and test (0.959) differ because their source mix differs; the checkpoint was selected with early stopping on validation, never on the test sets. With 164 documents we cannot separate small differences.
+- *Compute.* The 128 MB model exceeds the original 100 MB target. Vocabulary pruning is prepared but unused. Width-batched recognition was tried and discarded (20 images: 15.3 s to 21.5 s).
+- *Licensing.* LayoutLMv3 weights are CC BY-NC-SA 4.0, so the fine-tuned model is research-only and kept out of the GPLv3 repository and the APK; a permissive replacement is needed before any distribution.
+- *Scoring strictness.* Exact match counts near-miss merchants as wrong; a token-level or edit-distance score would show the gap.
+
+*Threats to validity.* The test set is South-East-Asian; the OCR engine is shared across systems; heuristics were tuned in part while looking at errors on the same documents, so their score is optimistic; the hand-verified Roboflow test is not yet available.
+
+= Adjusted Plan for the Last Five Weeks
+#figure(
+  table(
+    columns: (0.14fr, 0.6fr, 0.26fr),
+    align: left,
+    [Weeks], [Milestone / Evidence], [Output],
+    [11], [Hand-verify the 150-image frozen test; compute detector crop accuracy and the baseline on real photos.], [Table + IoU],
+    [12], [Label \~200 Spanish/Latin receipts; evaluate heuristics and model on them.], [Spanish F1],
+    [13], [Ablations: with and without deskew, enhancement, hybrid overlay; error analysis by blur and tilt.], [Ablation table],
+    [14], [Android latency, memory and preview fps (`gfxinfo`) over repeated runs; optional vocabulary pruning.], [Mean ± SD],
+    [15], [Fine-tune on Spanish data if week 12 shows a gap; freeze results; finish IMRaD paper and README.], [Final paper],
+  ),
+  caption: [Plan for the remaining five weeks],
+  kind: table,
+) <tab-plan2>
+
+If the Spanish evaluation fails, the fallback is the heuristic parser for Spanish and the model for English receipts.
+
+= Research Integrity
+The numbers in this report were produced by the scripts named in Section III-E on the frozen splits, except those attributed to Deliverable 1, the Colab notebook or the design notes, which are copied from their logs. Generative AI assistants were used to support coding, drafting and organisation; the authors remain responsible for the code, claims and sources.
 
 // --------------------------- REFERENCIAS -----------------------------
 #plain-heading[References]
@@ -259,7 +398,6 @@ This first deliverable is a research proposal with historical detector-training 
 #[
   #set text(size: 8pt)
   #set par(first-line-indent: 0pt, hanging-indent: 1.6em, spacing: 0.45em, leading: 0.5em, justify: true)
-  // Toda la referencia es clicable; el texto se mantiene negro y solo el DOI/URL va en azul.
   #show link: set text(fill: black)
   #let blue(body) = text(fill: rgb("#1a3d7c"), body)
   #let ref-item(n, url, body) = par[#box(width: 1.6em)[[#n]]#link(url, body)]
@@ -271,4 +409,6 @@ This first deliverable is a research proposal with historical detector-training 
   #ref-item(5, "https://arxiv.org/abs/2009.09941")[C. Du et al., "PP-OCR: A Practical Ultra Lightweight OCR System," _arXiv preprint #blue[arXiv:2009.09941]_, 2020.]
   #ref-item(6, "https://mlanthology.org/neuripsw/2019/park2019neuripsw-cord/")[S. Park et al., "CORD: A Consolidated Receipt Dataset for Post-OCR Parsing," _Document Intelligence Workshop at NeurIPS_, 2019. [Online]. Available: #blue("https://mlanthology.org/neuripsw/2019/park2019neuripsw-cord/").]
   #ref-item(7, "https://github.com/ultralytics/ultralytics")[G. Jocher, A. Chaurasia, and J. Qiu, _Ultralytics YOLOv8_, software, 2023. [Online]. Available: #blue("https://github.com/ultralytics/ultralytics").]
+  #ref-item(8, "https://doi.org/10.1109/ICDAR.2019.00244")[Z. Huang et al., "ICDAR2019 Competition on Scanned Receipt OCR and Information Extraction," in _Proc. ICDAR_, 2019. doi: #blue[10.1109/ICDAR.2019.00244].]
+  #ref-item(9, "https://doi.org/10.48550/arXiv.2103.14470")[W. Sun et al., "Spatial Dual-Modality Graph Reasoning for Key Information Extraction (WildReceipt)," _arXiv preprint #blue[arXiv:2103.14470]_, 2021.]
 ]
